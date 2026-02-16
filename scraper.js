@@ -1,251 +1,227 @@
 const puppeteer = require('puppeteer');
 
-class ToolStationScraper {
-  constructor() {
-    this.browser = null;
-  }
+let browser = null;
 
-  async init() {
-    if (!this.browser) {
-      this.browser = await puppeteer.launch({
-        headless: 'new',
-        args: [
-          '--no-sandbox',
-          '--disable-setuid-sandbox',
-          '--disable-dev-shm-usage',
-          '--disable-gpu'
-        ]
-      });
-    }
+async function getBrowser() {
+  if (!browser) {
+    browser = await puppeteer.launch({
+      headless: 'new',
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-accelerated-2d-canvas',
+        '--disable-gpu',
+        '--window-size=1920x1080'
+      ]
+    });
   }
+  return browser;
+}
 
-  async close() {
-    if (this.browser) {
-      await this.browser.close();
-      this.browser = null;
-    }
-  }
-
-  async search(query, page = 1, perPage = 24) {
-    await this.init();
+// Tool Station specific scraper (backward compatible)
+async function scrapeSearch(query, page = 1) {
+  const browser = await getBrowser();
+  const browserPage = await browser.newPage();
+  
+  try {
+    const url = `https://www.toolstation.com/search?q=${encodeURIComponent(query)}&page=${page}`;
     
-    const browserPage = await this.browser.newPage();
-    
-    try {
-      // Set viewport and user agent
-      await browserPage.setViewport({ width: 1920, height: 1080 });
-      await browserPage.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+    await browserPage.goto(url, { 
+      waitUntil: 'networkidle2',
+      timeout: 30000 
+    });
+
+    await browserPage.waitForSelector('.product-card, .no-results', { timeout: 10000 });
+
+    const products = await browserPage.evaluate(() => {
+      const items = [];
+      const cards = document.querySelectorAll('.product-card');
       
-      // Navigate to search page
-      const url = `https://www.toolstation.com/search?q=${encodeURIComponent(query)}`;
-      await browserPage.goto(url, { waitUntil: 'networkidle0', timeout: 30000 });
-      
-      // Wait for products to load - look for price elements which indicate products are loaded
-      await browserPage.waitForFunction(
-        () => {
-          const priceElements = document.querySelectorAll('[class*="price"]');
-          return priceElements.length > 0;
-        },
-        { timeout: 15000 }
-      ).catch(() => {});
-      
-      // Additional wait for dynamic content
-      await new Promise(resolve => setTimeout(resolve, 3000));
-      
-      // Extract product data
-      const products = await browserPage.evaluate(() => {
-        const results = [];
-        const seenProducts = new Set();
+      cards.forEach(card => {
+        const titleEl = card.querySelector('.product-title, h3, h2');
+        const priceEl = card.querySelector('.price, [class*="price"]');
+        const imageEl = card.querySelector('img');
+        const linkEl = card.querySelector('a');
+        const brandEl = card.querySelector('.brand, [class*="brand"]');
         
-        // Strategy: Find all links that go to product pages
-        const productLinks = Array.from(document.querySelectorAll('a[href]'))
-          .filter(a => {
-            const href = a.getAttribute('href') || '';
-            return href.match(/\/[^\/]+\/p\d+$/);
+        if (titleEl) {
+          items.push({
+            title: titleEl.textContent.trim(),
+            price: priceEl ? priceEl.textContent.trim() : null,
+            image: imageEl ? imageEl.src : null,
+            url: linkEl ? linkEl.href : null,
+            brand: brandEl ? brandEl.textContent.trim() : null
           });
-        
-        productLinks.forEach(link => {
-          const href = link.getAttribute('href');
-          const productCodeMatch = href.match(/\/p(\d+)$/);
-          
-          if (!productCodeMatch) return;
-          
-          const productCode = productCodeMatch[1];
-          if (seenProducts.has(productCode)) return;
-          seenProducts.add(productCode);
-          
-          // Find the container that has both the link and price
-          let container = link;
-          let foundContainer = null;
-          
-          for (let i = 0; i < 15; i++) {
-            if (!container || !container.parentElement) break;
-            container = container.parentElement;
-            
-            const text = container.textContent || '';
-            
-            // Check if this container has price info
-            if (text.includes('£') && text.includes('ex. VAT')) {
-              foundContainer = container;
-              break;
-            }
-          }
-          
-          if (!foundContainer) return;
-          
-          const containerText = foundContainer.textContent || '';
-          
-          // Extract title - get the longest meaningful text from links in this container
-          const titleCandidates = Array.from(foundContainer.querySelectorAll('a[href*="/p"]'))
-            .map(a => a.textContent.trim())
-            .filter(t => t.length > 10 && !t.includes('Add to') && !t.includes('Collection') && !t.includes('Delivery'))
-            .sort((a, b) => b.length - a.length);
-          
-          const title = titleCandidates[0] || '';
-          
-          if (!title || title.length < 5) return;
-          
-          // Extract price (the main price, not ex VAT)
-          const priceMatches = containerText.match(/£([\d,]+\.?\d*)/g);
-          const price = priceMatches && priceMatches.length > 0 ? priceMatches[0] : null;
-          
-          // Extract reviews count
-          const reviewMatch = containerText.match(/\(\s*(\d+)\s*\)/);
-          const reviews = reviewMatch ? parseInt(reviewMatch[1]) : 0;
-          
-          // Extract image
-          const img = foundContainer.querySelector('img');
-          let image = null;
-          if (img) {
-            image = img.src || img.getAttribute('data-src') || null;
-          }
-          
-          // Extract brand from title
-          const brandMatch = title.match(/^([A-Z][A-Za-z\s&]+?)(?:\s+[A-Z0-9]|$)/);
-          const brand = brandMatch ? brandMatch[1].trim() : null;
-          
-          results.push({
-            productCode,
-            title,
-            brand,
-            price,
-            reviews,
-            image,
-            url: `https://www.toolstation.com${href}`
-          });
-        });
-        
-        // Get total results count
-        const totalText = document.body.textContent;
-        const totalMatch = totalText.match(/(\d+)\s*results/i) || totalText.match(/(\d+)\s*-\s*\d+\s+of\s+(\d+)/i);
-        const total = totalMatch ? parseInt(totalMatch[totalMatch.length - 1]) : results.length;
-        
-        return { results, total };
+        }
       });
+      
+      return items;
+    });
 
-      await browserPage.close();
-      
-      return {
-        query,
-        page,
-        perPage,
-        total: products.total,
-        results: products.results.slice(0, perPage)
-      };
-      
-    } catch (error) {
-      await browserPage.close();
-      throw new Error(`Search failed: ${error.message}`);
-    }
-  }
-
-  async getProduct(productCode) {
-    await this.init();
-    
-    const browserPage = await this.browser.newPage();
-    
-    try {
-      // Set viewport and user agent
-      await browserPage.setViewport({ width: 1920, height: 1080 });
-      await browserPage.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
-      
-      // Try to navigate to product page
-      const url = `https://www.toolstation.com/p${productCode}`;
-      const response = await browserPage.goto(url, { waitUntil: 'networkidle0', timeout: 30000 });
-      
-      // Check if page loaded successfully
-      if (!response.ok() && response.status() === 404) {
-        throw new Error('Product not found');
+    const totalResults = await browserPage.evaluate(() => {
+      const resultsEl = document.querySelector('.results-count, [class*="results"]');
+      if (resultsEl) {
+        const match = resultsEl.textContent.match(/(\d+)/);
+        return match ? parseInt(match[1]) : 0;
       }
-      
-      // Wait for product content
-      await browserPage.waitForSelector('h1', { timeout: 10000 });
-      await new Promise(resolve => setTimeout(resolve, 2000));
-      
-      // Extract product details
-      const product = await browserPage.evaluate((code) => {
-        const title = document.querySelector('h1')?.textContent?.trim() || null;
-        
-        // Extract brand
-        const brandText = document.body.textContent;
-        const brandMatch = brandText.match(/by\s+([A-Za-z\s&]+)\s+Product/i);
-        const brand = brandMatch ? brandMatch[1].trim() : null;
-        
-        // Extract price
-        const priceText = document.body.textContent;
-        const priceMatches = priceText.match(/£([\d,]+\.?\d*)/g);
-        const price = priceMatches && priceMatches.length > 0 ? priceMatches[0] : null;
-        
-        // Extract VAT price
-        const vatMatch = priceText.match(/ex\.\s*VAT\s*£([\d,]+\.?\d*)/i);
-        const priceExVAT = vatMatch ? `£${vatMatch[1]}` : null;
-        
-        // Extract reviews
-        const reviewMatch = priceText.match(/\(\s*(\d+)\s*\)/);
-        const reviews = reviewMatch ? parseInt(reviewMatch[1]) : 0;
-        
-        // Extract rating
-        const ratingElement = document.querySelector('[class*="rating"]');
-        const rating = ratingElement ? ratingElement.textContent.trim() : null;
-        
-        // Extract images
-        const images = Array.from(document.querySelectorAll('img'))
-          .map(img => img.src || img.getAttribute('data-src'))
-          .filter(src => src && (src.includes('toolstation') || src.includes('product') || src.includes('media')))
-          .filter(src => !src.includes('logo') && !src.includes('icon'))
-          .slice(0, 5);
-        
-        // Extract availability
-        const availabilityText = document.body.textContent;
-        const inStock = !availabilityText.includes('Out of stock');
-        
-        // Extract description
-        const description = document.querySelector('[class*="description"]')?.textContent?.trim() || null;
-        
-        return {
-          productCode: code,
-          title,
-          brand,
-          price,
-          priceExVAT,
-          rating,
-          reviews,
-          images,
-          inStock,
-          description,
-          url: window.location.href
-        };
-      }, productCode);
-      
-      await browserPage.close();
-      
-      return product;
-      
-    } catch (error) {
-      await browserPage.close();
-      throw new Error(`Product fetch failed: ${error.message}`);
-    }
+      return 0;
+    });
+
+    return {
+      query,
+      page,
+      totalResults,
+      products,
+      count: products.length
+    };
+  } finally {
+    await browserPage.close();
   }
 }
 
-module.exports = ToolStationScraper;
+// Tool Station product details (backward compatible)
+async function scrapeProduct(productCode) {
+  const browser = await getBrowser();
+  const page = await browser.newPage();
+  
+  try {
+    const url = `https://www.toolstation.com/p${productCode}`;
+    
+    await page.goto(url, { 
+      waitUntil: 'networkidle2',
+      timeout: 30000 
+    });
+
+    await page.waitForSelector('h1, .product-title', { timeout: 10000 });
+
+    const product = await page.evaluate(() => {
+      const bodyText = document.body.innerText;
+      
+      // Extract price using regex pattern
+      const pricePattern = /£([\d,]+\.?\d*)\s+ex\.\s*VAT\s+£([\d,]+\.?\d*)/i;
+      const priceMatch = bodyText.match(pricePattern);
+      
+      const title = document.querySelector('h1, .product-title')?.textContent.trim();
+      const brand = document.querySelector('.brand, [class*="brand"]')?.textContent.trim();
+      
+      // Get all images and filter out icons/logos
+      const images = Array.from(document.querySelectorAll('img'))
+        .map(img => img.src)
+        .filter(src => 
+          src.includes('product') || 
+          src.includes('/images/') ||
+          (src.includes('toolstation') && !src.includes('logo') && !src.includes('icon'))
+        )
+        .filter(src => !src.endsWith('.svg'))
+        .slice(0, 10);
+      
+      // Extract rating
+      const ratingEl = document.querySelector('[class*="rating"], .stars');
+      let rating = null;
+      if (ratingEl) {
+        const ratingText = ratingEl.textContent || ratingEl.getAttribute('aria-label') || '';
+        const ratingMatch = ratingText.match(/([\d.]+)/);
+        rating = ratingMatch ? parseFloat(ratingMatch[1]) : null;
+      }
+      
+      return {
+        title,
+        brand,
+        price: priceMatch ? `£${priceMatch[1]}` : null,
+        priceExVAT: priceMatch ? `£${priceMatch[2]}` : null,
+        images,
+        rating,
+        url: window.location.href
+      };
+    });
+
+    return product;
+  } finally {
+    await page.close();
+  }
+}
+
+// NEW: Generic scraper with dynamic configuration
+async function scrapeWithConfig(siteConfig, query) {
+  const browser = await getBrowser();
+  const page = await browser.newPage();
+  
+  try {
+    // Replace {query} placeholder in search URL
+    const url = siteConfig.searchUrl.replace('{query}', encodeURIComponent(query));
+    
+    await page.goto(url, { 
+      waitUntil: 'networkidle2',
+      timeout: 30000 
+    });
+
+    // Wait for product cards to load
+    const productCardSelector = siteConfig.selectors.productCard;
+    await page.waitForSelector(`${productCardSelector}, .no-results, .no-products`, { 
+      timeout: 10000 
+    }).catch(() => {
+      console.log('No products found or timeout waiting for selector');
+    });
+
+    // Extract products using provided selectors
+    const products = await page.evaluate((config) => {
+      const items = [];
+      const cards = document.querySelectorAll(config.selectors.productCard);
+      
+      cards.forEach(card => {
+        try {
+          const getElementText = (selector) => {
+            const el = card.querySelector(selector);
+            return el ? el.textContent.trim() : null;
+          };
+          
+          const getElementAttr = (selector, attr) => {
+            const el = card.querySelector(selector);
+            return el ? el.getAttribute(attr) : null;
+          };
+          
+          const title = getElementText(config.selectors.title);
+          const price = getElementText(config.selectors.price);
+          const image = getElementAttr(config.selectors.image, 'src');
+          const link = getElementAttr(config.selectors.link, 'href');
+          
+          // Optional selectors
+          const brand = config.selectors.brand ? getElementText(config.selectors.brand) : null;
+          const rating = config.selectors.rating ? getElementText(config.selectors.rating) : null;
+          
+          if (title) {
+            items.push({
+              title,
+              price,
+              image,
+              url: link ? (link.startsWith('http') ? link : new URL(link, window.location.origin).href) : null,
+              brand,
+              rating
+            });
+          }
+        } catch (err) {
+          console.error('Error extracting product:', err);
+        }
+      });
+      
+      return items;
+    }, siteConfig);
+
+    return {
+      site: siteConfig.name,
+      query,
+      products,
+      count: products.length,
+      url
+    };
+  } finally {
+    await page.close();
+  }
+}
+
+module.exports = {
+  scrapeSearch,
+  scrapeProduct,
+  scrapeWithConfig
+};
